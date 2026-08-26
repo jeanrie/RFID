@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "483909019434",
+    "project_id": "attendancesms-4b755",
+    "storage_bucket": "attendancesms-4b755.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:483909019434:android:3bdf461f407fa945dc6053",
+        "android_client_info": {
+          "package_name": "com.attendancesmsappv1"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyD8LjaF-3SjfDPHeV5E-n2CfzaaEzK_MMw"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
