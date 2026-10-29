@@ -1,106 +1,4 @@
-// MainScreen.js — Native-Watchdog Edition + Editable SMS Time Window
-//                + Auto-Resume on Launch + JS Fallback Restart Timers
-//                + TRUE Scheduled Stop/Start
-//                + DB/SMS/Email TIMEOUTS + NATIVE HARD-RESTART BACKSTOP
-//                + SINGLE NOTIFICATION PER RESTART EVENT
-//                + RECONNECT-STUCK ESCALATION + GLOBAL CRASH NOTICE
-//                + DYNAMIC DAILY RESTART TIED TO USER'S SMS WINDOW
-//                + RECONNECT HANG FIX
-//                + WINDOW-BOUNDARY DUPLICATE-RESTART FIX + LOG-TIMESTAMP
-//                  WINDOW VALIDATION (this revision)
-//
-//  🔧 FIXED (this revision — "4x Auto-Restart notices at window open, and
-//            a 7:55 AM log gets sent right after the 8:00 AM window opens"):
-//
-//     BUG #1 — DUPLICATE RESTARTS AT THE WINDOW-OPEN BOUNDARY
-//     ROOT CAUSE: When the SMS window opens (e.g. 8:00 AM), the window
-//     scheduler calls _activateProcessing(), which starts a BRAND NEW
-//     lifecycleCoordinator() run — this IS the "daily restart" for that
-//     boundary. But TWO OTHER, entirely independent mechanisms were also
-//     separately watching for "now is within 5 minutes of the configured
-//     Start Time" and would ALSO fire their own restart request a few
-//     seconds/minutes later, for the exact same boundary:
-//       1. WatchdogModule.kt's native scheduleDailyRestartCheck() (runs
-//          every 60s once the watchdog is (re)started)
-//       2. MainScreen.js runLoop()'s own JS-fallback daily-restart check
-//     Neither of these knew that the coordinator had JUST freshly started
-//     BECAUSE of that same boundary, so each treated it as a still-pending
-//     "daily restart due" event and fired independently — giving 2 extra
-//     restart cycles (4 SMS: 2x STARTING + 2x COMPLETE) on top of the
-//     silent, notice-free initial activation.
-//
-//     FIX: both the native watchdog's start() (see WatchdogModule.kt) and
-//     this file's runLoop() now PRE-MARK the current day's boundary as
-//     "already handled" the moment a loop actually starts/restarts at (or
-//     within DAILY_RESTART_FIRE_WINDOW_MIN of) that boundary. If a restart
-//     is happening because of the boundary, that restart itself satisfies
-//     the daily-restart requirement — nothing else needs to fire again for
-//     the same boundary on the same day.
-//
-//     Also added activatingRef as a re-entrancy guard around
-//     _activateProcessing(), since it awaits before coordinatorRunningRef
-//     actually flips true, leaving a small window where a second
-//     applyWindowSchedule() tick (from the 60s fallback interval or an
-//     AppState change) could have raced in and called it a second time.
-//
-//     BUG #2 — BACKLOG LOGS FROM BEFORE THE WINDOW GET SENT ANYWAY
-//     ROOT CAUSE: the DB claim/select queries used a hardcoded
-//     '00:00:00'–'23:59:59' time range (the WHOLE day), and the only
-//     window check before actually sending a message was
-//     isSmsWindowOpen() — which only checks "is the CURRENT clock time
-//     inside the window", never the log record's OWN `time` column. So a
-//     7:55 AM attendance log (before an 8:00 AM window) sits unsent in
-//     the DB, gets claimed the instant the app queries at/after 8:00 AM
-//     (because the query itself wasn't time-filtered), and then passes
-//     the isSmsWindowOpen() check simply because it's now 8:00 AM+ —
-//     even though the LOG itself is from before the window ever opened.
-//
-//     FIX:
-//       1. The claim UPDATE and SELECT queries now filter by the log's
-//          own `time` column against the CURRENT configured Start/End
-//          time (recomputed every loop iteration, in case the window is
-//          edited while running), instead of the full 00:00–23:59 range.
-//       2. A new isLogTimeWithinWindow(log.time) check is added
-//          alongside isSmsWindowOpen() in the per-record processing loop,
-//          as defense-in-depth — a record only gets sent if BOTH "the
-//          window is open right now" AND "this specific log's own
-//          timestamp falls inside the configured window" are true.
-//
-//     No other behavior in this file was changed.
-//
-//  ✅ All timing-critical work (watchdog, auto-restart, daily restart)
-//     runs in WatchdogModule (Kotlin HandlerThread) — immune to JS suspension
-//  ✅ JS-side fallback restart timers — if the native 3hr/daily timers
-//     ever fail to fire, the JS loop independently tracks elapsed
-//     wall-clock time and forces the same restart sequence.
-//  ✅ Auto-resume on launch — persists an "appShouldRun" flag in
-//     AsyncStorage. If the app process is restarted for any reason (crash,
-//     device reboot via BootReceiver, hard-restart kill, manually reopening
-//     the app) while that flag is true, the app re-arms the scheduler
-//     automatically.
-//  ✅ SMS sending window is USER-EDITABLE via time pickers
-//  ✅ Daily restart now follows that SAME user-editable window — restarts
-//     once at Start Time, once at End Time, every day
-//  ✅ Pending SMS messages are released back to the queue if the window
-//     closes mid-cycle and are automatically retried once it reopens
-//  ✅ Email notifications for window open/close are always allowed 24/7
-//  ✅ Flat coordinator loop — zero recursion, clean state reset every restart
-//  ✅ pingHeartbeat() called every loop iteration so the native watchdog
-//     knows the JS thread is alive
-//  ✅ WatchdogModule.resetAutoRestartTimer() called after every restart so
-//     the 3-hour clock starts fresh
-//  ✅ Exactly ONE "restarting" notice + ONE "restart complete" notice per
-//     restart event — no more duplicate SMS/email spam
-//  ✅ Reconnect failures escalate (backoff + periodic re-notify +
-//     forced restart after 5 min stuck) instead of retrying silently forever
-//  ✅ Global JS error handler attempts an emergency SMS before a
-//     fatal crash takes the app down
-//  ✅ reconnect() can no longer hang indefinitely on a stuck MSSQL.close()
-//  ✅ NEW: window-open no longer triggers 2-4 redundant duplicate restarts
-//  ✅ NEW: SMS is only ever sent for logs whose OWN timestamp falls inside
-//     the configured window — backlog logs from before/after the window
-//     are never processed, no matter when the app happens to query them
-
+// MainScreen.js
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import {
   View, Text, TextInput, TouchableOpacity, StyleSheet, Platform,
@@ -127,56 +25,20 @@ const { width, height } = Dimensions.get('window');
 const WEB_CLIENT_ID =
   '651284152046-22s1bs6beejjmd6jkop35rdi6hsaapqt.apps.googleusercontent.com';
 
-// ─── Timing constants (passed to native WatchdogModule, also used by the ──────
-//     JS-side fallback timers below)
+
 const AUTO_RESTART_INTERVAL_MS    = 3 * 60 * 60 * 1000;  // 3 hours
-const WATCHDOG_STUCK_THRESHOLD_MS = 5 * 60 * 1000;       // 10 minutes
+const WATCHDOG_STUCK_THRESHOLD_MS = 5 * 60 * 1000;       // 5 minutes
 
-// The daily restart hour is no longer a fixed constant — it follows
-// whatever the user has set as the SMS Start Time / End Time on this
-// screen (see startTimeRef / endTimeRef usage below).
-
-// how much EXTRA silence beyond WATCHDOG_STUCK_THRESHOLD_MS the
-// native watchdog tolerates before concluding JS is truly wedged and
-// force-killing/relaunching the whole app. Total silence before nuking:
-// WATCHDOG_STUCK_THRESHOLD_MS + HARD_RESTART_GRACE_MS = 10min + 15min = 25min.
-// That's comfortably longer than DB_OP_TIMEOUT_MS below, so a normal
-// timeout-triggered reconnect always has time to resolve itself first.
 const HARD_RESTART_GRACE_MS = 5 * 60 * 1000;
 
-// hard ceiling for any single DB call (connect/executeUpdate/
-// executeQuery). A stalled/dead connection now fails fast instead of
-// hanging forever, so the existing catch-block reconnect logic can do its
-// job instead of the whole loop freezing silently.
 const DB_OP_TIMEOUT_MS = 45 * 1000;
 
-// hard ceiling for a single native SMS send and for email network
-// calls, for the same reason.
 const SMS_OP_TIMEOUT_MS   = 20 * 1000;
 const EMAIL_OP_TIMEOUT_MS = 20 * 1000;
-
-// hard ceiling for MSSQL.close(). A hung close() previously wedged the
-// entire JS thread inside reconnect(); see file header.
 const SAFE_CLOSE_TIMEOUT_MS = 10 * 1000;
-
-// hard ceiling for the WHOLE reconnect() sequence (close + sleep +
-// connect), as defense-in-depth on top of the individual timeouts above.
-const RECONNECT_OVERALL_TIMEOUT_MS = 60 * 1000; // 10s close + 1s sleep + 45s connect + margin
-
-// Window (in minutes) after the target restart boundary (Start Time or
-// End Time) during which the JS fallback is allowed to fire the daily
-// restart, to avoid re-firing it repeatedly throughout that minute span.
-// Also used (this revision) as the pre-mark window: if a loop actually
-// starts/restarts within this many minutes of a boundary, that boundary
-// is considered "handled" by this very restart.
+const RECONNECT_OVERALL_TIMEOUT_MS = 60 * 1000;
 const DAILY_RESTART_FIRE_WINDOW_MIN = 5;
-
-// Scheduler tuning: precise setTimeout handles the exact boundary; this
-// fallback interval is just a catch-up net in case the precise timer gets
-// suspended by Android (mirrors the existing 60s catch-up pattern already
-// used for the daily restart check).
-const WINDOW_SCHEDULE_FALLBACK_MS = 60 * 1000; // 1 minute
-
+const WINDOW_SCHEDULE_FALLBACK_MS = 60 * 1000;
 const APP_SHOULD_RUN_KEY = 'appShouldRun';
 
 const SMS_MAX_PROCESSING = 5;
@@ -186,34 +48,77 @@ const SIGNAL_NONE    = null;
 const SIGNAL_RESTART = 'restart';
 const SIGNAL_STOP    = 'stop';
 
-// hard cooldown between any two "restart" notifications (STARTING
-// or COMPLETE). No matter what causes a duplicate — a repeated native
-// event, a duplicated listener, or anything else — this is a last-line
-// guarantee that the exact same kind of restart notice can never go out
-// twice within this window. Real scheduled restarts are hours apart, so
-// this never blocks a legitimate notification.
+
 const RESTART_NOTIF_COOLDOWN_MS = 30 * 1000;
 
-// reconnect-stuck escalation tuning.
-// Base backoff and cap for repeated reconnect attempts: 5s, 10s, 15s...
-// up to 60s, instead of a flat 5s forever (which just hammers a server
-// that's already down/unreachable).
+
 const RECONNECT_BACKOFF_BASE_MS = 5 * 1000;
 const RECONNECT_BACKOFF_MAX_MS  = 60 * 1000;
-// While stuck reconnecting, remind admins every 5 minutes instead of
-// sending exactly one message and then going silent for however long
-// the outage lasts.
 const RECONNECT_RENOTIFY_INTERVAL_MS = 5 * 60 * 1000;
-// If reconnect() has failed continuously for this long, stop retrying
-// in-place and force a full coordinator restart instead (tears down and
-// rebuilds all loop state, including a fresh MSSQL connection object,
-// instead of possibly retrying against the same wedged native connection
-// forever).
 const RECONNECT_STUCK_RESTART_MS = 5 * 60 * 1000;
+
+
+let ACTIVE_LOOP_ID = 0;                    
+const GLOBAL_SENDING_SEEDS = new Set();    
+const SENT_NUMBERS = new Map();           
+const SENT_TS = new Map();                 
+const DUPLICATE_LOG_WINDOW_SEC = 60;       
+
+// Admin failure-notice guards 
+const INVALID_NOTIFIED = new Set();               // seeds already emailed for an invalid number
+const FAIL_NOTIFY_TS = {};                      
+const FAIL_NOTIFY_COOLDOWN_MS = 30 * 60 * 1000;   // one email per kind per 30 min
+
+
+// delivery report can be matched back to a student
+const PENDING_DELIVERY = {};
+const DELIVERY_NOTIFIED = new Set();              
+const PENDING_DELIVERY_TTL_MS = 2 * 60 * 60 * 1000;
+
+// Critical-alert throttle for logs where NO number could be texted
+const CRITICAL_ALERTED = new Map();                  
+const CRITICAL_REMIND_MS = 6 * 60 * 60 * 1000;       
+
+const SENT_STORE_KEY = 'sentNumbersStore';
+const SENT_STORE_TTL_MS = 2 * 24 * 60 * 60 * 1000;
+let SENT_STORE_LOADED = false;
+let persistChain = Promise.resolve();
+
+
+const persistSentNumbers = () => {
+  persistChain = persistChain.then(async () => {
+    const obj = {};
+    SENT_NUMBERS.forEach((set, seed) => {
+      obj[seed] = { n: [...set], t: SENT_TS.get(seed) || Date.now() };
+    });
+    await AsyncStorage.setItem(SENT_STORE_KEY, JSON.stringify(obj));
+  }).catch((e) => console.warn('persistSentNumbers failed:', e?.message || e));
+  return persistChain;
+};
+
+// Load once (after a restart/crash)
+const loadSentNumbers = async () => {
+  if (SENT_STORE_LOADED) return;
+  try {
+    const raw = await AsyncStorage.getItem(SENT_STORE_KEY);
+    if (raw) {
+      const obj = JSON.parse(raw);
+      const now = Date.now();
+      Object.keys(obj).forEach((seed) => {
+        const e = obj[seed];
+        if (e && Array.isArray(e.n) && now - (e.t || 0) < SENT_STORE_TTL_MS) {
+          SENT_NUMBERS.set(seed, new Set(e.n));
+          SENT_TS.set(seed, e.t || now);
+        }
+      });
+    }
+  } catch (e) { console.warn('loadSentNumbers failed:', e?.message || e); }
+  SENT_STORE_LOADED = true;
+};
 
 export default function MainScreen() {
 
-  // ── UI state ────────────────────────────────────────────────────────────────
+
   const [isRunning,        setIsRunning]        = useState(false);
   const [isScheduled,      setIsScheduled]      = useState(false);
   const [numStudents,      setNumStudents]      = useState('10');
@@ -240,77 +145,54 @@ export default function MainScreen() {
   const [cycleCount,       setCycleCount]       = useState(0);
   const [statusMessage,    setStatusMessage]    = useState('');
 
-  // ── Foreground service hook ──────────────────────────────────────────────────
+  //  Foreground service hook 
   const {
     startForegroundService,
     stopForegroundService,
     updateServiceStatus,
   } = useForegroundService();
 
-  // ── Runtime refs ────────────────────────────────────────────────────────────
+  
   const isRunningRef             = useRef(false);
   const cycleCountRef            = useRef(0);
   const failedSendsRef           = useRef({});
-  const sendingSeedsRef          = useRef(new Set());
   const batteryAlertSentRef      = useRef(false);
   const emailQueueRef            = useRef([]);
   const sendingEmailRef          = useRef(false);
   const smsPermissionGrantedRef  = useRef(false);
   const networkErrorSentRef      = useRef(false);
 
-  // reconnect-stuck escalation refs.
+  // Reconnect-stuck escalation refs.
   const reconnectFailStreakRef   = useRef(0);
   const reconnectStuckSinceRef   = useRef(0);
   const lastNetworkErrorNotifRef = useRef(0);
 
-  // ── Coordinator lifecycle refs ───────────────────────────────────────────────
+  
   const restartSignalRef         = useRef(SIGNAL_NONE);
   const restartReasonRef         = useRef('');
   const coordinatorRunningRef    = useRef(false);
   const coordinatorRestartingRef = useRef(false);
-  // set to true by anything (e.g. the watchdog-stuck alert) that
-  // already told admins "the loop is restarting" for the CURRENT restart
-  // cycle. lifecycleCoordinator checks this before sending its own generic
-  // "AUTO-RESTART STARTING" notice, so only ONE "starting" message ever
-  // goes out per restart — never two or three for the same event.
   const restartStartNotifiedRef  = useRef(false);
-  // timestamp (ms) of the last STARTING/COMPLETE restart notice
-  // actually sent. Used as a hard cooldown so the same kind of message can
-  // never fire twice back-to-back, regardless of what triggered it.
   const lastRestartNotifSentAtRef = useRef(0);
 
-  // ── JS-side fallback restart timers ──────────────────────────────────────────
+  // JS-side fallback restart timers 
   const loopStartTimestampRef        = useRef(0);
-  // TWO separate "fired today" trackers — one for the restart lined
-  // up with SMS Start Time, one for the restart lined up with SMS End Time.
-  // Kept independent so each fires exactly once per calendar day, even
-  // though they usually land many hours apart. 🔧 Also now pre-marked at
-  // loop start — see runLoop() — to prevent duplicate restarts right at
-  // the window-open/close boundary.
   const dailyStartRestartFiredDateRef = useRef(null);
   const dailyEndRestartFiredDateRef   = useRef(null);
 
-  // ── Auto-resume-on-launch guard ──────────────────────────────────────────────
+
   const autoStartAttemptedRef    = useRef(false);
 
-  // ── SMS-window scheduler refs ─────────────────────────────────────────────────
+  // SMS-window scheduler refs
   const windowSchedulerActiveRef = useRef(false);
   const windowScheduleTimeoutRef = useRef(null);
   const applyWindowScheduleRef   = useRef(() => {});
   const windowNotifSentRef       = useRef({ open: false, close: false });
-  // 🔧 NEW — re-entrancy guard for _activateProcessing(). There's a small
-  // async gap between applyWindowSchedule() deciding to activate and
-  // coordinatorRunningRef actually flipping true (lifecycleCoordinator()
-  // is only called AFTER an awaited notifySmsWindowOpen()). Without this
-  // guard, a second applyWindowSchedule() tick landing in that gap (e.g.
-  // from the 60s fallback interval or an AppState change) could call
-  // _activateProcessing() a second time.
+
   const activatingRef            = useRef(false);
 
-  // ── Native watchdog event subscriptions ──────────────────────────────────────
   const watchdogSubsRef          = useRef([]);
 
-  // ── Config refs (mirror state for use inside async callbacks) ────────────────
   const serverNameRef       = useRef(serverName);
   const usernameRef         = useRef(username);
   const passwordRef         = useRef(password);
@@ -342,21 +224,13 @@ export default function MainScreen() {
   useEffect(() => { departureMessageRef.current = departureMessage; }, [departureMessage]);
   useEffect(() => { isRunningRef.current        = isRunning;        }, [isRunning]);
 
-  // keep the native watchdog's emergency contact info fresh even if
-  // the loop isn't restarting right now — it's what the hard-restart
-  // backstop uses to send an SMS directly, bypassing JS entirely.
+
   useEffect(() => {
     try { WatchdogModule?.updateEmergencyContacts?.(adminNumbers || '', deviceName || ''); }
     catch {}
   }, [adminNumbers, deviceName]);
 
-  // keep the native watchdog's daily-restart window (start hour/min,
-  // end hour/min) in sync with the user-configured SMS Start/End Time even
-  // while the app keeps running — without waiting for the next full
-  // restart to pick it up. WatchdogModule.kt exposes
-  // updateDailyRestartWindow(startHour, startMinute, endHour, endMinute)
-  // for exactly this. Guarded with optional chaining + try/catch so it's
-  // a harmless no-op on older native builds that don't have the method yet.
+  // Keep the native watchdog's daily-restart window in sync with the SMS window.
   useEffect(() => {
     if (!isRunningRef.current) return;
     try {
@@ -373,13 +247,13 @@ export default function MainScreen() {
     }
   }, [startTime, endTime]);
 
-  // ── KeepAwake (JS layer — belt-and-suspenders with native WakeLock) ──────────
+
   useEffect(() => {
     KeepAwake.activate();
     return () => { KeepAwake.deactivate(); };
   }, []);
 
-  // ── AppState listener — re-arm foreground service + re-check schedule ────────
+
   useEffect(() => {
     const sub = AppState.addEventListener('change', (nextState) => {
       if (nextState === 'active') {
@@ -390,7 +264,7 @@ export default function MainScreen() {
     return () => sub.remove();
   }, [startForegroundService]);
 
-  // ── Battery optimization prompt (shown once) ─────────────────────────────────
+  // Battery optimization 
   useEffect(() => {
     (async () => {
       try {
@@ -409,8 +283,7 @@ export default function MainScreen() {
     })();
   }, []);
 
-  // ── Global JS error handler — best-effort emergency SMS before a ───────────
-  //    fatal crash takes the whole app down silently.
+ 
   useEffect(() => {
     const GlobalErrorUtils = global.ErrorUtils;
     if (!GlobalErrorUtils || !GlobalErrorUtils.setGlobalHandler) return;
@@ -435,8 +308,7 @@ export default function MainScreen() {
             `The app may close or restart now. Please check the device ` +
             `and make sure the SMS process is still running.`;
 
-          // Fire-and-forget: the app may be moments from dying, so we
-          // deliberately do NOT await these. Best-effort only.
+  
           if (nums.length > 0 && SmsModule?.sendSMS) {
             nums.forEach((num) => {
               try { SmsModule.sendSMS(num, msg).catch(() => {}); } catch {}
@@ -447,9 +319,6 @@ export default function MainScreen() {
         }
       }
 
-      // Always defer to whatever RN's own handler normally does
-      // (red box in dev, crash reporting / process termination in prod)
-      // so behavior outside of this emergency notice is unchanged.
       if (previousHandler) previousHandler(error, isFatal);
     };
 
@@ -460,7 +329,7 @@ export default function MainScreen() {
     };
   }, []);
 
-  // ── Google Sign-In ───────────────────────────────────────────────────────────
+  // Google Sign-In
   useEffect(() => {
     (async () => {
       try {
@@ -474,6 +343,44 @@ export default function MainScreen() {
         if (!user) await GoogleSignin.signIn();
       } catch (err) { console.error('Google Sign-In init error:', err); }
     })();
+  }, []);
+
+
+  useEffect(() => {
+    if (!SmsModule || Platform.OS !== 'android') return;
+    const emitter = new NativeEventEmitter(SmsModule);
+    const sub = emitter.addListener('smsDeliveryReport', (e) => {
+      try {
+        const info = PENDING_DELIVERY[e?.number];
+        if (!info) return;                       // not a parent SMS (e.g. admin alert)
+        delete PENDING_DELIVERY[e.number];
+        if (!e.permanentFail) return;            // delivered or unknown 
+
+        const key = `${info.seed}|${e.number}`;
+        if (DELIVERY_NOTIFIED.has(key)) return;
+        DELIVERY_NOTIFIED.add(key);
+
+        console.warn(`Delivery FAILED for ${e.number} (status ${e.status})`);
+
+        if (adminEmailsRef.current?.trim()) {
+          queueEmailStable(
+            'SMS Delivery Failed - Parent Number',
+            `SMS DELIVERY FAILED\n\n` +
+            `Student: ${info.studentName}\n` +
+            `Parent/Guardian Number: ${e.number}\n` +
+            `Device: ${deviceNameRef.current}\n\n` +
+            `The carrier accepted the SMS for processing, but the message was not successfully delivered ` +
+            `(carrier status code: ${e.status}).\n\n` +
+            `Possible reasons include an inactive or unreachable number, network-related issues, ` +
+            `or other carrier restrictions.\n\n` +
+            `The message will not be automatically retried. Please verify the parent/guardian number ` +
+            `in the student record and update it if necessary.`
+          );
+        }
+      } catch (err) { console.warn('delivery report handler failed:', err?.message || err); }
+    });
+    return () => { try { sub.remove(); } catch {} };
+
   }, []);
 
   // ── Load saved config ────────────────────────────────────────────────────────
@@ -507,7 +414,7 @@ export default function MainScreen() {
     })();
   }, []);
 
-  // ── Persist SMS start/end time whenever they change ──────────────────────────
+
   useEffect(() => {
     (async () => {
       try {
@@ -520,7 +427,7 @@ export default function MainScreen() {
     })();
   }, [startTime, endTime]);
 
-  // ── Fallback catch-up interval for the window scheduler ──────────────────────
+  
   useEffect(() => {
     const id = setInterval(() => {
       applyWindowScheduleRef.current?.();
@@ -528,7 +435,7 @@ export default function MainScreen() {
     return () => clearInterval(id);
   }, []);
 
-  // ── Cleanup on unmount ───────────────────────────────────────────────────────
+ 
   useEffect(() => {
     return () => {
       _unsubscribeWatchdog();
@@ -536,10 +443,10 @@ export default function MainScreen() {
       restartSignalRef.current = SIGNAL_STOP;
       if (windowScheduleTimeoutRef.current) clearTimeout(windowScheduleTimeoutRef.current);
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, []);
 
-  // ── AUTO-RESUME ON LAUNCH ─────────────────────────────────────────────────────
+ 
   useEffect(() => {
     (async () => {
       if (autoStartAttemptedRef.current) return;
@@ -563,7 +470,7 @@ export default function MainScreen() {
         console.error('Auto-resume check failed:', err);
       }
     })();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, [doStart]);
 
   const navigation = useNavigation();
@@ -572,25 +479,20 @@ export default function MainScreen() {
     if (err && __DEV__) console.error('Failed to load sound', err);
   });
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Pure helpers
-  // ─────────────────────────────────────────────────────────────────────────────
+
   const sleep        = (ms) => new Promise(r => setTimeout(r, ms));
   const isValidPhone = (num) => /^(?:\+63|0)9\d{9}$/.test(num);
-  // de-duplicated — if the Admin Numbers field ever ends up with
-  // the same number listed twice (extra comma, copy-paste mistake, etc.),
-  // sendSMSStable used to loop over it and text that number twice for
-  // every single alert. A Set removes exact duplicates before sending.
-  const getValidNumbers = (raw) =>
-    raw
-      ? [...new Set(
-          raw.split(/[,;]+/).map(n => n.trim()).filter(n => n.length > 0 && isValidPhone(n))
-        )]
-      : [];
 
-  // races any promise against a timeout. A promise that never
-  // settles (dead connection, dropped broadcast receiver, etc.) now
-  // rejects instead of hanging the loop forever.
+  // Normalize (+63 → 0) and de-duplicate, so "+63917..." and "0917..." count
+
+  const normalizePhone = (n) => n.replace(/^\+63/, '0');
+  const uniqueNumbers  = (arr) =>
+    [...new Set(arr.map(n => String(n).trim()).filter(isValidPhone).map(normalizePhone))];
+
+  const getValidNumbers = (raw) =>
+    raw ? uniqueNumbers(raw.split(/[,;]+/)) : [];
+
+
   const withTimeout = (promise, ms, label) =>
     new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -602,10 +504,7 @@ export default function MainScreen() {
       );
     });
 
-  // DB helpers — every query/update now has a hard ceiling so a
-  // stalled connection fails fast and gets caught by the existing
-  // reconnect-and-retry logic in runLoop's catch block, instead of the
-  // whole loop silently freezing.
+  // DB helpers
   const dbUpdate = useCallback((sql) =>
     withTimeout(MSSQL.executeUpdate(sql), DB_OP_TIMEOUT_MS, 'DB update'), []);
   const dbQuery = useCallback((sql) =>
@@ -616,9 +515,7 @@ export default function MainScreen() {
     return `${h % 12 || 12}:${m < 10 ? '0' + m : m} ${ampm}`;
   };
 
-  // 🔧 NEW — small zero-padding helper + SQL-friendly HH:MM:SS formatter,
-  // used to build the DB time-window filter from the user-configured
-  // Start/End time instead of a hardcoded full-day range.
+ 
   const pad2 = (n) => (n < 10 ? '0' + n : String(n));
   const formatSqlTime = (date) => `${pad2(date.getHours())}:${pad2(date.getMinutes())}:00`;
 
@@ -638,15 +535,7 @@ export default function MainScreen() {
     catch { return 100; }
   };
 
-  // 🔧 FIXED — MSSQL.close() previously had NO timeout. If it hung on a
-  // dead/broken socket (the normal case right after a network drop),
-  // `await safeClose()` inside reconnect() never resolved or rejected,
-  // which wedged the ENTIRE JS thread inside runLoop's catch block
-  // forever. This was the root cause of "Reconnecting" never recovering:
-  // no more heartbeat pings, and the existing exponential backoff / stuck-
-  // reconnect escalation downstream never got a chance to run.
-  // A hung close() is not fatal — we're about to open a brand new
-  // connection anyway — so on timeout we just log and move on.
+  // MSSQL.close() with a timeout 
   const safeClose = async () => {
     try {
       if (MSSQL?.close) {
@@ -657,9 +546,7 @@ export default function MainScreen() {
     }
   };
 
-  // ── SMS window check — uses the USER-CONFIGURED startTimeRef / endTimeRef ───
-  //    Checks the CURRENT clock time only. See isLogTimeWithinWindow below
-  //    for validating a specific LOG RECORD's own timestamp.
+  // SMS window check 
   const isSmsWindowOpen = useCallback(() => {
     const now      = new Date();
     const nowMin   = now.getHours() * 60 + now.getMinutes();
@@ -670,12 +557,7 @@ export default function MainScreen() {
     return nowMin >= startMin && nowMin < endMin;
   }, []);
 
-  // 🔧 NEW — validates a LOG RECORD's own `time` field (e.g. "07:55:00")
-  // against the configured Start/End window. This is the check that was
-  // missing: isSmsWindowOpen() only ever answered "is it currently inside
-  // the window", never "was THIS attendance event inside the window". A
-  // backlog record from before the window opened must never pass just
-  // because the window happens to be open by the time it's looked at.
+  // Validates a LOG RECORD's own `time` field against the configured window.
   const isLogTimeWithinWindow = useCallback((logTimeStr) => {
     if (!logTimeStr) return false;
     const parts = String(logTimeStr).split(':');
@@ -690,7 +572,6 @@ export default function MainScreen() {
     return logMin >= startMin && logMin < endMin;
   }, []);
 
-  // ── Exact ms until the next start/end boundary crossing ───────────────────────
   const msUntilNextBoundary = useCallback(() => {
     const now = new Date();
     const st  = startTimeRef.current;
@@ -706,9 +587,7 @@ export default function MainScreen() {
     return Math.min(startDt.getTime(), endDt.getTime()) - now.getTime();
   }, []);
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Signal helpers
-  // ─────────────────────────────────────────────────────────────────────────────
+
   const _requestRestart = useCallback((reason) => {
     if (restartSignalRef.current !== SIGNAL_NONE) return;
     console.log(`📨 Restart requested: ${reason}`);
@@ -721,9 +600,7 @@ export default function MainScreen() {
     restartSignalRef.current = SIGNAL_STOP;
   }, []);
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Native watchdog subscriptions
-  // ─────────────────────────────────────────────────────────────────────────────
+
   const _subscribeWatchdog = useCallback(() => {
     if (!WatchdogModule) return;
     _unsubscribeWatchdog();
@@ -748,10 +625,6 @@ export default function MainScreen() {
 
       updateServiceStatus(`⚠️ Loop stuck ${mins}m — restarting`);
       const stuckNowTs = Date.now();
-      // same cooldown lock applies here — if this listener is ever
-      // invoked more than once for one underlying native event (e.g. a
-      // stale duplicate subscription), only the first invocation actually
-      // sends anything.
       if (stuckNowTs - lastRestartNotifSentAtRef.current >= RESTART_NOTIF_COOLDOWN_MS) {
         lastRestartNotifSentAtRef.current = stuckNowTs;
         if (adminEmailsRef.current?.trim()) {
@@ -767,11 +640,6 @@ export default function MainScreen() {
       } else {
         console.log('🔕 Suppressing duplicate LOOP STUCK notice (cooldown)');
       }
-      // This alert already told admins the loop is restarting — mark the
-      // restart as "already notified" so lifecycleCoordinator's generic
-      // "AUTO-RESTART STARTING" message is skipped for this cycle. Without
-      // this, admins would get BOTH this stuck alert AND a separate
-      // "starting" message for the same event.
       restartStartNotifiedRef.current = true;
       _requestRestart(reason);
     });
@@ -789,25 +657,19 @@ export default function MainScreen() {
       if (!isRunningRef.current) return;
       if (coordinatorRestartingRef.current) return;
       if (restartSignalRef.current !== SIGNAL_NONE) return;
-      // e.boundary is "start" or "end" — WatchdogModule.kt fires this
-      // event independently for both the SMS Start Time and End Time.
       const boundary = e.boundary ? ` (${e.boundary} boundary)` : '';
       const reason = e.reason || `Daily restart (native)${boundary}`;
       console.log(`🌅 Native daily restart event${boundary}: ${reason}`);
       _requestRestart(reason);
     });
 
-    // purely informational — by the time this fires, the native
-    // side has already sent an emergency SMS and is about to kill the
-    // process, entirely independent of JS. This listener may or may not
-    // get a chance to run depending on how wedged JS is; that's fine,
-    // it's not required for the recovery to work.
+
     const s4 = emitter.addListener('hardRestartTriggered', (e) => {
       console.error(`💀 Native hard-restart triggered: ${e.reason || ''}`);
     });
 
     watchdogSubsRef.current = [s1, s2, s3, s4];
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+  
   }, [_requestRestart, updateServiceStatus, isSmsWindowOpen]);
 
   const _unsubscribeWatchdog = useCallback(() => {
@@ -815,21 +677,11 @@ export default function MainScreen() {
     watchdogSubsRef.current = [];
   }, []);
 
-  // subscribe to native watchdog events exactly ONCE, for the
-  // whole lifetime of this screen — not once per restart cycle. Before,
-  // _startNativeWatchdog() called _subscribeWatchdog() on every single
-  // restart, which un-subscribes the old listeners then adds new ones. If
-  // `.remove()` on an old listener ever silently failed (the code wraps it
-  // in try/catch), the new listener would stack on top of the old one, and
-  // every future native event would fire its JS handler TWICE — which is
-  // exactly the kind of bug that makes the same restart message go out
-  // more than once. Subscribing once on mount removes that failure mode
-  // entirely; _startNativeWatchdog/_stopNativeWatchdog below now only
-  // start/stop the native timers, they never touch listeners.
+
   useEffect(() => {
     _subscribeWatchdog();
     return () => { _unsubscribeWatchdog(); };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+
   }, []);
 
   const _startNativeWatchdog = useCallback(() => {
@@ -840,9 +692,6 @@ export default function MainScreen() {
     WatchdogModule.start(
       WATCHDOG_STUCK_THRESHOLD_MS,
       AUTO_RESTART_INTERVAL_MS,
-      // dynamic: the native daily-restart backstop fires at BOTH
-      // the user's configured SMS Start Time AND End Time, with full
-      // hour+minute precision.
       startTimeRef.current.getHours(),
       startTimeRef.current.getMinutes(),
       endTimeRef.current.getHours(),
@@ -861,9 +710,6 @@ export default function MainScreen() {
     try { WatchdogModule?.stop?.(); } catch {}
   }, []);
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // SMS helpers
-  // ─────────────────────────────────────────────────────────────────────────────
   const ensureSmsPermission = useCallback(async () => {
     if (smsPermissionGrantedRef.current) return true;
     if (Platform.OS !== 'android') return true;
@@ -880,31 +726,54 @@ export default function MainScreen() {
     return false;
   }, []);
 
-  const sendSMSStable = useCallback(async (numbers = [], message) => {
+
+  const sendSMSStable = useCallback(async (numbers = [], message, doneSet = null, persist = null, failInfo = null) => {
     try {
-      if (!await ensureSmsPermission()) return false;
+      if (!await ensureSmsPermission()) {
+        if (failInfo) failInfo.__permission = true;
+        return false;
+      }
       if (!Array.isArray(numbers) || numbers.length === 0 || !message) return true;
       const valid = numbers.filter(isValidPhone);
       if (valid.length === 0) return true;
       let allOk = true;
       for (const num of valid) {
+        if (doneSet?.has(num)) continue;           
+
+    
+        doneSet?.add(num);
+        if (persist) await persist();
+
         try {
-          // the native SMS module's promise resolves via a
-          // dynamically-registered BroadcastReceiver. If Android ever
-          // drops that broadcast, this promise would hang forever and
-          // freeze the whole SMS loop. Now it fails fast instead.
-          const r = await withTimeout(SmsModule.sendSMS(num, message), SMS_OP_TIMEOUT_MS, 'SmsModule.sendSMS');
-          if (!(r && r.success)) allOk = false;
+          const r = await withTimeout(
+            SmsModule.sendSMS(num, message), SMS_OP_TIMEOUT_MS, 'SmsModule.sendSMS'
+          );
+          if (!(r && r.success)) {
+            doneSet?.delete(num);                    
+            if (persist) await persist();
+            if (failInfo) failInfo[num] = { code: r?.code ?? 0, reason: r?.reason || 'UNKNOWN' };
+            allOk = false;
+          }
           await sleep(1500);
-        } catch (e) { console.error(`SMS error on ${num}`, e); allOk = false; }
+        } catch (e) {
+          const m = String(e?.message || e);
+          if (m.includes('timed out') || e?.code === 'SMS_SENT_TIMEOUT') {
+            console.warn(`SMS to ${num} unconfirmed — assuming sent (no resend)`);
+           
+          } else {
+            console.error(`SMS error on ${num}`, e);
+            doneSet?.delete(num);                      
+            if (persist) await persist();
+            if (failInfo) failInfo[num] = { code: -1, reason: m };
+            allOk = false;
+          }
+        }
       }
       return allOk;
     } catch (e) { console.error('sendSMS fatal:', e); return false; }
   }, [ensureSmsPermission]);
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Email helpers (always allowed — not gated by SMS window)
-  // ─────────────────────────────────────────────────────────────────────────────
+
   const processEmailQueue = useCallback(async () => {
     if (sendingEmailRef.current) return;
     sendingEmailRef.current = true;
@@ -933,17 +802,7 @@ export default function MainScreen() {
     processEmailQueue();
   }, [processEmailQueue]);
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // DB helpers
-  // ─────────────────────────────────────────────────────────────────────────────
-  // 🔧 FIXED — reconnect() is now ALSO wrapped in an outer withTimeout(),
-  // on top of safeClose()'s own internal timeout and MSSQL.connect()'s
-  // existing DB_OP_TIMEOUT_MS. This is deliberate defense-in-depth: no
-  // single awaited call inside reconnect() — now or added later — can
-  // ever wedge the calling code above it (the runLoop catch-block's
-  // stuck-reconnect escalation, and every subsequent pingHeartbeat() call)
-  // again. This was the root cause of the loop getting permanently stuck
-  // in "Reconnecting" with no recovery.
+
   const reconnect = useCallback(async () => {
     await withTimeout((async () => {
       await safeClose();
@@ -959,14 +818,91 @@ export default function MainScreen() {
     })(), RECONNECT_OVERALL_TIMEOUT_MS, 'reconnect');
   }, []);
 
+  // Final mark (smssent=1) AFTER the send, with retries.
   const markSent = useCallback(async (seed, devName) => {
+    for (let i = 0; i < 3; i++) {
+      try {
+        await dbUpdate(
+          `UPDATE logs SET smssent=1, smsmac='${devName}', smssenttime=GETDATE(),` +
+          ` smsprocessing=ISNULL(smsprocessing,0)+1 WHERE seed='${seed}'`
+        );
+        return true;
+      } catch (e) {
+        console.error(`markSent attempt ${i + 1} failed:`, e?.message || e);
+        await sleep(1000);
+      }
+    }
+    return false;
+  }, [dbUpdate]);
+
+
+  const lockSending = useCallback(async (seed, devName) => {
+    const rows = await dbQuery(
+      `UPDATE logs SET smssenttime=GETDATE()
+       OUTPUT inserted.seed
+       WHERE seed='${seed}' AND smssent=0 AND smssenttime IS NULL AND smsmac='${devName}';`
+    );
+    return Array.isArray(rows) && rows.length > 0;
+  }, [dbQuery]);
+
+  // Definite fail: release the lock so the log can be retried.
+  const releaseLock = useCallback(async (seed, devName) => {
+    for (let i = 0; i < 2; i++) {
+      try {
+        await dbUpdate(
+          `UPDATE logs SET smssenttime=NULL, smsprocessing=ISNULL(smsprocessing,0)+1` +
+          ` WHERE seed='${seed}' AND smsmac='${devName}' AND smssent=0`
+        );
+        return;
+      } catch (e) { console.error('releaseLock failed:', e?.message || e); }
+    }
+  }, [dbUpdate]);
+
+  
+  const recoverStaleLocks = useCallback(async (devName) => {
     try {
       await dbUpdate(
-        `UPDATE logs SET smssent=1, smsmac='${devName}', smssenttime=GETDATE()` +
-        ` WHERE seed='${seed}'`
+        `UPDATE logs SET smssenttime=NULL
+         WHERE smssent=0 AND smssenttime IS NOT NULL AND smsmac='${devName}'
+           AND CONVERT(VARCHAR(10),date,120)=CONVERT(VARCHAR(10),GETDATE(),120)
+           AND smssenttime < DATEADD(MINUTE,-5,GETDATE())`
       );
-    } catch (e) { console.error('markSent:', e); }
+    } catch (e) { console.warn('recoverStaleLocks failed:', e?.message || e); }
   }, [dbUpdate]);
+
+  const isDuplicateLog = useCallback(async (log) => {
+    try {
+      const rows = await dbQuery(
+        `SELECT TOP 1 seed FROM logs
+         WHERE studentid='${log.studentid}' AND trans='${log.trans}'
+           AND seed<>'${log.seed}' AND smssent=1
+           AND CONVERT(VARCHAR(10),date,120)=CONVERT(VARCHAR(10),GETDATE(),120)
+           AND ABS(DATEDIFF(SECOND, CONVERT(TIME,time), CONVERT(TIME,'${log.time}'))) <= ${DUPLICATE_LOG_WINDOW_SEC}`
+      );
+      return Array.isArray(rows) && rows.length > 0;
+    } catch { return false; }
+  }, [dbQuery]);
+
+
+  const handleMaxFailures = useCallback(async (log, validNumbers, studentName, failedThisCycle, devName) => {
+    const seed = log.seed;
+    const done = SENT_NUMBERS.get(seed);
+    const sentNums   = validNumbers.filter(n => done?.has(n));
+    const missedNums = validNumbers.filter(n => !done?.has(n));
+    delete failedSendsRef.current[seed];
+
+    if (sentNums.length > 0) {
+      const marked = await markSent(seed, devName);
+      if (marked) {
+        SENT_NUMBERS.delete(seed);
+        SENT_TS.delete(seed);
+        await persistSentNumbers();
+      }
+      failedThisCycle.push({ studentName, seed, partial: { sent: sentNums, missed: missedNums } });
+    } else {
+      failedThisCycle.push({ studentName, seed });
+    }
+  }, [markSent]);
 
   const notifyNetworkError = useCallback(async (errorMsg) => {
     try {
@@ -983,9 +919,7 @@ export default function MainScreen() {
     } catch (e) { console.log('notifyNetworkError failed:', e); }
   }, [sendSMSStable, queueEmailStable, isSmsWindowOpen]);
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // SMS window open/close notifications
-  // ─────────────────────────────────────────────────────────────────────────────
+  
   const notifySmsWindowOpen = useCallback(async () => {
     if (windowNotifSentRef.current.open) return;
     windowNotifSentRef.current.open  = true;
@@ -1017,9 +951,7 @@ export default function MainScreen() {
     if (adminEmailsRef.current?.trim()) queueEmailStable('SMS Window Closed', msg);
   }, [queueEmailStable, updateServiceStatus]);
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // MAIN LOOP — runs only while SMS processing is "activated" (window open)
-  // ─────────────────────────────────────────────────────────────────────────────
+
   const runLoop = useCallback(async () => {
     const limit   = parseInt(numStudentsRef.current, 10) || 5;
     const idleMs  = (parseInt(idleSecondsRef.current, 10) || 5) * 1000;
@@ -1029,17 +961,9 @@ export default function MainScreen() {
     updateServiceStatus('Starting SMS process...');
 
     loopStartTimestampRef.current = Date.now();
+    const myLoopId = ++ACTIVE_LOOP_ID;    
 
-    // 🔧 FIXED — if this loop is starting/restarting right at (or within
-    // DAILY_RESTART_FIRE_WINDOW_MIN of) a configured Start/End boundary,
-    // that's usually BECAUSE of the boundary (the window just opened via
-    // _activateProcessing, or a native/JS daily-restart already fired and
-    // this IS that restart). Pre-mark the boundary as "already handled
-    // today" so the JS-fallback check further down doesn't ALSO fire a
-    // redundant duplicate restart for the exact same boundary a few
-    // seconds/minutes later. (Native side has the matching fix in
-    // WatchdogModule.kt's start().) This was the main cause of getting
-    // 2-4 duplicate "AUTO-RESTART" SMS notices right at window open.
+   
     {
       const nowAtLoopStart  = new Date();
       const todayKeyAtStart = nowAtLoopStart.toDateString();
@@ -1049,140 +973,82 @@ export default function MainScreen() {
       const startBoundaryMinAtStart = stAtStart.getHours() * 60 + stAtStart.getMinutes();
       const endBoundaryMinAtStart   = etAtStart.getHours() * 60 + etAtStart.getMinutes();
 
-      if (
-        nowMinAtStart >= startBoundaryMinAtStart &&
-        nowMinAtStart < startBoundaryMinAtStart + DAILY_RESTART_FIRE_WINDOW_MIN
-      ) {
+      if (nowMinAtStart >= startBoundaryMinAtStart &&
+          nowMinAtStart < startBoundaryMinAtStart + DAILY_RESTART_FIRE_WINDOW_MIN) {
         dailyStartRestartFiredDateRef.current = todayKeyAtStart;
       }
-      if (
-        nowMinAtStart >= endBoundaryMinAtStart &&
-        nowMinAtStart < endBoundaryMinAtStart + DAILY_RESTART_FIRE_WINDOW_MIN
-      ) {
+      if (nowMinAtStart >= endBoundaryMinAtStart &&
+          nowMinAtStart < endBoundaryMinAtStart + DAILY_RESTART_FIRE_WINDOW_MIN) {
         dailyEndRestartFiredDateRef.current = todayKeyAtStart;
       }
     }
 
-    // reset reconnect-stuck escalation state at the start of every
-    // fresh runLoop invocation (i.e. every restart cycle), so a previous
-    // cycle's failure streak/timers never bleed into the new one.
     reconnectFailStreakRef.current   = 0;
     reconnectStuckSinceRef.current   = 0;
     lastNetworkErrorNotifRef.current = 0;
 
     try {
-      // 🔧 FIXED — this initial connect used to be a bare `await
-      // reconnect()` with NO try/catch of its own. If it failed or timed
-      // out (e.g. the underlying DB/network issue that just forced this
-      // very restart hadn't actually resolved yet), the exception went
-      // straight past the entire while-loop's retry/backoff/escalation
-      // machinery below and landed in the OUTER catch (outerErr) further
-      // down — which never touches restartSignalRef. runLoop() then
-      // returned normally with restartSignalRef STILL SIGNAL_NONE, and
-      // lifecycleCoordinator's exit check (`signal === SIGNAL_STOP ||
-      // signal === SIGNAL_NONE`) misread that as a deliberate "clean
-      // stop" and silently killed the whole coordinator — with a
-      // mislabeled "Stopped (SMS window closed)" status even in the
-      // middle of the configured window, zero notification, and zero
-      // further attempts to send anything until the window scheduler's
-      // 60s fallback happened to notice and reactivate from scratch
-      // (which then hit the exact same failure again if the DB/network
-      // issue was still ongoing — an invisible restart-and-die loop that
-      // never actually sends any SMS).
-      //
-      // Fix: swallow a failed initial connect here and fall through into
-      // the while loop anyway. The very first dbUpdate/dbQuery call below
-      // will then fail for the same underlying reason, but THAT failure
-      // is caught by the existing catch(loopErr) block, which already has
-      // full handling — exponential backoff, periodic admin re-notify,
-      // and an eventual forced restart via _requestRestart() (which
-      // properly sets restartSignalRef) if it stays stuck for more than
-      // RECONNECT_STUCK_RESTART_MS. So a failed initial connect now gets
-      // exactly the same robust recovery path as any other DB failure,
-      // instead of a silent, invisible coordinator death.
+    
       try {
         await reconnect();
       } catch (initialConnectErr) {
-        console.error(
-          'Initial connect failed — deferring to in-loop recovery logic:',
-          initialConnectErr?.message || initialConnectErr
-        );
+        console.error('Initial connect failed — deferring to in-loop recovery logic:',
+          initialConnectErr?.message || initialConnectErr);
       }
 
-      while (restartSignalRef.current === SIGNAL_NONE) {
+      
+      await loadSentNumbers();
+      try { await recoverStaleLocks(devName); } catch {}
 
-        // ── Ping native watchdog so it knows the JS loop is alive ──────────
+      while (restartSignalRef.current === SIGNAL_NONE && myLoopId === ACTIVE_LOOP_ID) {
+
+        
         try { WatchdogModule?.pingHeartbeat?.(); } catch {}
 
-        // ── JS FALLBACK: 3-hour auto-restart ────────────────────────────────
+       
         if (Date.now() - loopStartTimestampRef.current >= AUTO_RESTART_INTERVAL_MS) {
           _requestRestart('JS fallback: 3-hour interval elapsed (native timer did not fire)');
         }
 
-        // ── JS FALLBACK: daily restart — tied to the user's SMS ─────────────
-        //    Start Time AND End Time (instead of a fixed hour). Fires once
-        //    per calendar day at each boundary.
         if (restartSignalRef.current === SIGNAL_NONE) {
           const nowDt    = new Date();
           const todayKey = nowDt.toDateString();
           const nowMinutesOfDay = nowDt.getHours() * 60 + nowDt.getMinutes();
-
           const st = startTimeRef.current;
           const et = endTimeRef.current;
           const startBoundaryMin = st.getHours() * 60 + st.getMinutes();
           const endBoundaryMin   = et.getHours() * 60 + et.getMinutes();
 
-          // Restart lined up with the SMS window OPENING (Start Time)
-          if (
-            restartSignalRef.current === SIGNAL_NONE &&
-            nowMinutesOfDay >= startBoundaryMin &&
-            nowMinutesOfDay < startBoundaryMin + DAILY_RESTART_FIRE_WINDOW_MIN &&
-            dailyStartRestartFiredDateRef.current !== todayKey
-          ) {
+          if (restartSignalRef.current === SIGNAL_NONE &&
+              nowMinutesOfDay >= startBoundaryMin &&
+              nowMinutesOfDay < startBoundaryMin + DAILY_RESTART_FIRE_WINDOW_MIN &&
+              dailyStartRestartFiredDateRef.current !== todayKey) {
             dailyStartRestartFiredDateRef.current = todayKey;
-            _requestRestart(
-              `JS fallback: daily restart at SMS window start (${formatTime(st)})`
-            );
+            _requestRestart(`JS fallback: daily restart at SMS window start (${formatTime(st)})`);
           }
 
-          // Restart lined up with the SMS window CLOSING (End Time)
-          if (
-            restartSignalRef.current === SIGNAL_NONE &&
-            nowMinutesOfDay >= endBoundaryMin &&
-            nowMinutesOfDay < endBoundaryMin + DAILY_RESTART_FIRE_WINDOW_MIN &&
-            dailyEndRestartFiredDateRef.current !== todayKey
-          ) {
+          if (restartSignalRef.current === SIGNAL_NONE &&
+              nowMinutesOfDay >= endBoundaryMin &&
+              nowMinutesOfDay < endBoundaryMin + DAILY_RESTART_FIRE_WINDOW_MIN &&
+              dailyEndRestartFiredDateRef.current !== todayKey) {
             dailyEndRestartFiredDateRef.current = todayKey;
-            _requestRestart(
-              `JS fallback: daily restart at SMS window end (${formatTime(et)})`
-            );
+            _requestRestart(`JS fallback: daily restart at SMS window end (${formatTime(et)})`);
           }
         }
 
         if (restartSignalRef.current !== SIGNAL_NONE) break;
 
-        // 🔧 FIXED — startHH/endHH now come from the user-configured SMS
-        // window (recomputed every iteration in case it's edited while
-        // running) instead of a hardcoded 00:00:00–23:59:59 full-day
-        // range. Previously the DB queries claimed EVERY unsent record
-        // for today regardless of its own time — including logs from
-        // BEFORE the window opened (e.g. a 7:55 AM log) — and the
-        // per-record check further down only compared against the
-        // CURRENT clock time, not the log's own timestamp, so as soon as
-        // the window opened at 8:00 AM that stale 7:55 AM backlog record
-        // got sent anyway.
-        const winSt  = startTimeRef.current;
-        const winEt  = endTimeRef.current;
-        const startHH = formatSqlTime(winSt);
-        const endHH   = formatSqlTime(winEt);
+       
+        const startHH = formatSqlTime(startTimeRef.current);
+        const endHH   = formatSqlTime(endTimeRef.current);
 
         try {
-          // ── Claim records ──────────────────────────────────────────────────
+         
           await dbUpdate(`
             UPDATE logs SET smsmac='${devName}'
             WHERE seed IN (
               SELECT TOP (${limit}) seed FROM logs
-              WHERE smssent=0 AND (smsmac IS NULL OR smsmac='')
+              WHERE smssent=0 AND smssenttime IS NULL AND (smsmac IS NULL OR smsmac='')
                 AND CONVERT(VARCHAR(10),date,120)=CONVERT(VARCHAR(10),GETDATE(),120)
                 AND time >= '${startHH}' AND time < '${endHH}'
               ORDER BY smsprocessing ASC, date ASC, time ASC)`);
@@ -1194,32 +1060,27 @@ export default function MainScreen() {
               s.studentname, s.smsnotify, s.yearlevel, s.section
             FROM logs l
             INNER JOIN student s ON l.studentid=s.studentid
-            WHERE l.smssent=0 AND l.smsmac='${devName}'
+            WHERE l.smssent=0 AND l.smssenttime IS NULL AND l.smsmac='${devName}'
               AND CONVERT(VARCHAR(10),l.date,120)=CONVERT(VARCHAR(10),GETDATE(),120)
               AND l.time >= '${startHH}' AND l.time < '${endHH}'
             ORDER BY l.smsprocessing ASC, l.date ASC, l.time ASC;`);
 
-          // Ping again right after the DB round-trip — belt-and-suspenders
-          // in case a slow-but-successful query ate a big chunk of the
-          // heartbeat interval.
           try { WatchdogModule?.pingHeartbeat?.(); } catch {}
 
           if (!claimed || claimed.length === 0) {
-            // ── Idle ──────────────────────────────────────────────────────────
+          
             cycleCountRef.current += 1;
             setCycleCount(cycleCountRef.current);
-
-            const statusTxt =
-              `No new records. Idle cycle ${cycleCountRef.current} — ` +
-              `waiting ${idleSecondsRef.current}s...`;
-            setStatusMessage(statusTxt);
-
+            setStatusMessage(
+              `No new records. Idle cycle ${cycleCountRef.current} — waiting ${idleSecondsRef.current}s...`
+            );
             if (cycleCountRef.current % 10 === 0) {
               updateServiceStatus(`Idle cycle ${cycleCountRef.current} — sending active`);
+              await recoverStaleLocks(devName);
             }
 
           } else {
-            // ── Process records ────────────────────────────────────────────────
+           
             cycleCountRef.current = 0;
             setCycleCount(0);
             updateServiceStatus(`Processing ${claimed.length} record(s)...`);
@@ -1227,116 +1088,246 @@ export default function MainScreen() {
             const failedThisCycle = [];
 
             for (const log of claimed) {
-              if (restartSignalRef.current !== SIGNAL_NONE) break;
+              if (restartSignalRef.current !== SIGNAL_NONE || myLoopId !== ACTIVE_LOOP_ID) break;
 
-              // 🔧 FIXED — validate the LOG's own timestamp against the
-              // configured window, not just "is the window open right
-              // now". A backlog record from before the window opened
-              // (e.g. 7:55 AM when the window starts at 8:00 AM) must
-              // never be sent just because the window happens to be open
-              // at the moment it's being looked at. The SQL filter above
-              // already prevents this record from being claimed in the
-              // first place — this is defense-in-depth for anything
-              // already in flight or claimed under a previous window.
+              // Outside the window 
               if (!isSmsWindowOpen() || !isLogTimeWithinWindow(log.time)) {
                 try {
                   await dbUpdate(
-                    `UPDATE logs SET smsmac=NULL WHERE seed='${log.seed}' AND smssent=0`
+                    `UPDATE logs SET smsmac=NULL WHERE seed='${log.seed}' AND smssent=0 AND smssenttime IS NULL`
                   );
                 } catch {}
                 continue;
               }
 
-              if (sendingSeedsRef.current.has(log.seed)) continue;
-              sendingSeedsRef.current.add(log.seed);
+              if (GLOBAL_SENDING_SEEDS.has(log.seed)) continue;
+              GLOBAL_SENDING_SEEDS.add(log.seed);
 
-              const studentName = log.studentname || 'Student';
-              const trans       = log.trans || '';
-              const fmtDT       = formatLogDateTime(log.date, log.time);
-              const yr          = log.yearlevel || '';
-              const sec         = log.section   || '';
+              try {
+                const studentName = log.studentname || 'Student';
+                const trans       = log.trans || '';
+                const fmtDT       = formatLogDateTime(log.date, log.time);
+                const yr          = log.yearlevel || '';
+                const sec         = log.section   || '';
 
-              const message =
-                trans === 'TI'
-                  ? arrivalMessageRef.current
-                      .replace('{student}', studentName).replace('{time}', fmtDT)
-                      .replace('{year}', yr).replace('{section}', sec)
-                  : trans === 'TO'
-                  ? departureMessageRef.current
-                      .replace('{student}', studentName).replace('{time}', fmtDT)
+                const tpl = trans === 'TI' ? arrivalMessageRef.current
+                          : trans === 'TO' ? departureMessageRef.current
+                          : null;
+                const message = tpl
+                  ? tpl.replace('{student}', studentName).replace('{time}', fmtDT)
                       .replace('{year}', yr).replace('{section}', sec)
                   : `${studentName} ${trans} at ${fmtDT}.`;
 
-              const validNumbers = (
-                log.smsnotify
-                  ? log.smsnotify.split(/[,;]+/).map(n => n.trim())
-                  : []
-              ).filter(isValidPhone);
-
-              if (validNumbers.length === 0) {
-                await markSent(log.seed, devName);
-                sendingSeedsRef.current.delete(log.seed);
-                continue;
-              }
-
-              // Ping between sends too — a batch of several numbers each
-              // waiting up to SMS_OP_TIMEOUT_MS can otherwise eat a lot of
-              // wall-clock time between heartbeat pings.
-              try { WatchdogModule?.pingHeartbeat?.(); } catch {}
-
-              if (log.smsprocessing < SMS_MAX_PROCESSING) {
-                const ok = await sendSMSStable(validNumbers, message);
-                await dbUpdate(
-                  `UPDATE logs SET smsprocessing=ISNULL(smsprocessing,0)+1` +
-                  `${ok ? `, smssent=1, smssenttime=GETDATE()` : ''}` +
-                  ` WHERE seed='${log.seed}' AND smsmac='${devName}'`
+                const validNumbers = uniqueNumbers(
+                  log.smsnotify ? log.smsnotify.split(/[,;]+/) : []
                 );
-                if (ok) {
-                  await markSent(log.seed, devName);
-                  delete failedSendsRef.current[log.seed];
-                } else {
-                  failedSendsRef.current[log.seed] =
-                    (failedSendsRef.current[log.seed] || 0) + 1;
-                  if (failedSendsRef.current[log.seed] >= MAX_ERROR_CYCLES) {
-                    failedThisCycle.push({ studentName, seed: log.seed });
-                    delete failedSendsRef.current[log.seed];
+
+                // Numbers with a wrong format (not 09xxxxxxxxx / +639xxxxxxxxx)
+                const rawNumbers = (log.smsnotify ? log.smsnotify.split(/[,;]+/) : [])
+                  .map(n => n.trim()).filter(Boolean);
+                const invalidNumbers = rawNumbers.filter(n => !isValidPhone(n));
+
+                if (invalidNumbers.length > 0 && !INVALID_NOTIFIED.has(log.seed)) {
+                  INVALID_NOTIFIED.add(log.seed);
+                  if (adminEmailsRef.current?.trim()) {
+                    queueEmailStable(
+                      '⚠️ Invalid Parent Number',
+                      `INVALID PARENT NUMBER\n\n` +
+                      `Student: ${studentName} (${yr} ${sec})\n` +
+                      `Device: ${devName}\n` +
+                      `Invalid number(s): ${invalidNumbers.join(', ')}\n\n` +
+                      (validNumbers.length > 0
+                        ? `May SMS pa ring ipinadala sa ibang number ng parent.`
+                        : `WALANG SMS na naipadala, walang valid na number ang student.`) +
+                      `\n\nPaki-ayos ang number sa student record.`
+                    );
                   }
                 }
-              } else {
-                failedSendsRef.current[log.seed] =
-                  (failedSendsRef.current[log.seed] || 0) + 1;
-                if (failedSendsRef.current[log.seed] >= MAX_ERROR_CYCLES) {
-                  failedThisCycle.push({ studentName, seed: log.seed });
-                  delete failedSendsRef.current[log.seed];
+
+                if (validNumbers.length === 0) {
+                  await markSent(log.seed, devName);
+                  continue;
                 }
+
+                // Exceeded max attempts
+                if (log.smsprocessing >= SMS_MAX_PROCESSING) {
+                  failedSendsRef.current[log.seed] = (failedSendsRef.current[log.seed] || 0) + 1;
+                  if (failedSendsRef.current[log.seed] >= MAX_ERROR_CYCLES) {
+                    await handleMaxFailures(log, validNumbers, studentName, failedThisCycle, devName);
+                  }
+                  continue;
+                }
+
+                
+                if (await isDuplicateLog(log)) {
+                  console.log(`🔕 Duplicate log ${log.seed} — skipped`);
+                  await markSent(log.seed, devName);
+                  continue;
+                }
+
+                
+                if (!(await lockSending(log.seed, devName))) continue;
+
+                try { WatchdogModule?.pingHeartbeat?.(); } catch {}
+
+                if (!SENT_NUMBERS.has(log.seed)) {
+                  SENT_NUMBERS.set(log.seed, new Set());
+                  SENT_TS.set(log.seed, Date.now());
+                }
+                const done = SENT_NUMBERS.get(log.seed);
+
+                {
+                  const nowP = Date.now();
+                  Object.keys(PENDING_DELIVERY).forEach((k) => {
+                    if (nowP - PENDING_DELIVERY[k].ts > PENDING_DELIVERY_TTL_MS) delete PENDING_DELIVERY[k];
+                  });
+                  validNumbers.forEach((n) => {
+                    PENDING_DELIVERY[n] = { studentName, seed: log.seed, ts: nowP };
+                  });
+                }
+
+                const failInfo = {};
+                let ok = false;
+                try { ok = await sendSMSStable(validNumbers, message, done, persistSentNumbers, failInfo); }
+                catch (e) { console.error('send threw:', e); ok = false; }
+
+                if (ok) {
+                  const marked = await markSent(log.seed, devName);
+                  if (marked) {
+                    SENT_NUMBERS.delete(log.seed);
+                    SENT_TS.delete(log.seed);
+                    await persistSentNumbers();
+                    delete failedSendsRef.current[log.seed];
+                  } else {
+                    
+                    console.warn(`markSent failed for ${log.seed} — keeping SENT_NUMBERS to prevent resend`);
+                  }
+                } else {
+                
+                  {
+                    const entries = Object.entries(failInfo).filter(([k]) => k !== '__permission');
+                    const codes = entries.map(([, v]) => v.code);
+                    let kind, subject, detail;
+
+                    if (failInfo.__permission) {
+                      kind = 'NO_PERMISSION';
+                      subject = '🚫 SMS Permission Required';
+                      detail = 'The application does not have SEND_SMS permission. Please enable SMS permission in the device Settings and try again.';
+                    } else if (codes.includes(2) || codes.includes(4)) {
+                      kind = 'NO_SIGNAL';
+                      subject = 'SMS Sending Failed - No Signal';
+                      detail = 'The device has no available mobile signal or the radio is turned off (NO_SERVICE / RADIO_OFF). Please check the SIM card, mobile signal, and device network settings.';
+                    } else if (codes.includes(1)) {
+                      kind = 'NO_LOAD';
+                      subject = 'SMS Sending Failed - Insufficient Load/Credit';
+                      detail = 'The SMS could not be sent due to a GENERIC_FAILURE. Please verify that the SIM card has sufficient load or SMS credit. The issue may also be related to the mobile carrier.';
+                    } else {
+                      kind = 'OTHER';
+                      subject = 'SMS Sending Failed';
+                      detail =
+                        'The SMS could not be sent due to an unidentified error.\n\n' +
+                        'Please review the failure details below for further investigation.';
+                    }
+
+                    const nowF = Date.now();
+
+                    if (nowF - (FAIL_NOTIFY_TS[kind] || 0) >= FAIL_NOTIFY_COOLDOWN_MS) {
+                      FAIL_NOTIFY_TS[kind] = nowF;
+
+                      if (adminEmailsRef.current?.trim()) {
+                        queueEmailStable(
+                          subject,
+                          `${subject}\n\n` +
+                          `Device: ${devName}\n` +
+                          `Student: ${studentName}\n` +
+                          `${detail}\n\n` +
+                          `Failed SMS Number(s):\n` +
+                          (entries.map(([n, v]) => `• ${n} → ${v.reason}`).join('\n') || '(No additional details available)') +
+                          `\n\nThe application will automatically retry sending the SMS up to ${SMS_MAX_PROCESSING} time(s).`
+                        );
+                      }
+                    }
+                  }
+
+                  await releaseLock(log.seed, devName);
+                  failedSendsRef.current[log.seed] = (failedSendsRef.current[log.seed] || 0) + 1;
+                  if (failedSendsRef.current[log.seed] >= MAX_ERROR_CYCLES) {
+                    await handleMaxFailures(log, validNumbers, studentName, failedThisCycle, devName);
+                  }
+                }
+              } finally {
+                GLOBAL_SENDING_SEEDS.delete(log.seed);
               }
-              sendingSeedsRef.current.delete(log.seed);
             }
 
             if (failedThisCycle.length > 0) {
-              const failedNames = failedThisCycle.map(f => f.studentName).join(', ');
-              Alert.alert(
-                'SMS Sending Error',
-                `Failed to send SMS after ${MAX_ERROR_CYCLES} cycles. Check SIM load/credit.`
-              );
-              if (adminEmailsRef.current?.trim()) {
-                queueEmailStable(
-                  'Critical SMS Error',
-                  `Failed SMS recipients:\n${failedNames}\n\n` +
-                  `Device: ${devName}\n⚠️ Check SIM card credit/load.`
+              const nowC = Date.now();
+              const partialList = failedThisCycle.filter(f => f.partial);
+              
+              const totalList = failedThisCycle.filter(f => !f.partial).filter(f => {
+                const last = CRITICAL_ALERTED.get(f.seed) || 0;
+                if (nowC - last < CRITICAL_REMIND_MS) return false;
+                CRITICAL_ALERTED.set(f.seed, nowC);
+                return true;
+              });
+
+             
+              if (partialList.length > 0) {
+                const lines = partialList.map(f =>
+                  `• Student: ${f.studentName}\n` +
+                  `   Delivered to: ${f.partial.sent.join(', ')}\n` +
+                  `   Not delivered to: ${f.partial.missed.join(', ')}`
+                ).join('\n\n');
+
+                Alert.alert(
+                  'Partial SMS Delivery',
+                  `The SMS could not be delivered to one or more recipients after ` +
+                  `${MAX_ERROR_CYCLES} attempts. The record has been marked as sent because ` +
+                  `at least one recipient received the message.`
                 );
+
+                if (adminEmailsRef.current?.trim()) {
+                  queueEmailStable(
+                    'Partial SMS Delivery - Record Marked as Sent',
+                    `PARTIAL SMS DELIVERY\n\n` +
+                    `Device: ${devName}\n\n` +
+                    `${lines}\n\n` +
+                    `The message was delivered to at least one recipient, so the record has been ` +
+                    `marked as sent and will not be retried.\n\n` +
+                    `Recommended action: verify the SIM card balance and confirm that the number listed under "Not delivered to" is active and correct in the student record.`
+                  );
+                }
               }
-              try {
-                errorSound?.setVolume(1.0);
-                errorSound?.play(() => {});
-                Vibration.vibrate([0, 1000, 500, 1000, 500, 1000], false);
-              } catch {}
+
+             
+              if (totalList.length > 0) {
+                const failedNames = totalList.map(f => f.studentName).join(', ');
+                Alert.alert(
+                  'SMS Sending Error',
+                  `Failed to send SMS after ${MAX_ERROR_CYCLES} cycles. Check SIM load/credit.`
+                );
+                if (adminEmailsRef.current?.trim()) {
+                  queueEmailStable(
+                    'Critical SMS Error',
+                    `Failed SMS recipients:\n${failedNames}\n\n` +
+                    `Device: ${devName}\n⚠️ Check SIM card credit/load.`
+                  );
+                }
+              }
+
+              if (partialList.length > 0 || totalList.length > 0) {
+                try {
+                  errorSound?.setVolume(1.0);
+                  errorSound?.play(() => {});
+                  Vibration.vibrate([0, 1000, 500, 1000, 500, 1000], false);
+                } catch {}
+              }
             }
 
             setStatusMessage('Processed new records. Cycle counter reset.');
           }
 
-          // ── Battery check ──────────────────────────────────────────────────
+          // Battery check
           try {
             const level = await getBatteryLevel();
             if (level <= batteryThresholdRef.current && !batteryAlertSentRef.current) {
@@ -1357,30 +1348,22 @@ export default function MainScreen() {
           await sleep(idleMs);
 
         } catch (loopErr) {
-          // With DB_OP_TIMEOUT_MS in place, a stalled connection now
-          // lands here (as a timeout Error) instead of hanging forever.
+       
+          if (myLoopId !== ACTIVE_LOOP_ID) break;
+
           console.error('Loop iteration error:', loopErr);
           const errMsg = String(loopErr?.message || loopErr).toLowerCase();
           const isNetworkish =
-            errMsg.includes('network') ||
-            errMsg.includes('timeout') ||
-            errMsg.includes('timed out') ||
-            errMsg.includes('connection');
+            errMsg.includes('network') || errMsg.includes('timeout') ||
+            errMsg.includes('timed out') || errMsg.includes('connection');
 
-          // mark the start of a fresh failure streak so we can
-          // measure how long we've been continuously stuck.
           if (reconnectFailStreakRef.current === 0) {
             reconnectStuckSinceRef.current = Date.now();
           }
           const nowErr   = Date.now();
-          const stuckMs  = reconnectStuckSinceRef.current
-            ? nowErr - reconnectStuckSinceRef.current
-            : 0;
+          const stuckMs  = reconnectStuckSinceRef.current ? nowErr - reconnectStuckSinceRef.current : 0;
           const stuckMin = Math.max(1, Math.round(stuckMs / 60000));
 
-          // notify on the FIRST error, and then again every
-          // RECONNECT_RENOTIFY_INTERVAL_MS while still stuck — instead of
-          // exactly once and then silence for however long the outage lasts.
           if (isNetworkish) {
             const sinceLastNotif = nowErr - lastNetworkErrorNotifRef.current;
             if (!networkErrorSentRef.current || sinceLastNotif >= RECONNECT_RENOTIFY_INTERVAL_MS) {
@@ -1396,13 +1379,6 @@ export default function MainScreen() {
           setStatusMessage(`⚠️ Reconnecting... (${stuckMin}m, attempt #${reconnectFailStreakRef.current + 1})`);
           updateServiceStatus(`⚠️ Reconnecting to server (${stuckMin}m)...`);
 
-          // give up retrying in-place after RECONNECT_STUCK_RESTART_MS
-          // and force a full coordinator restart instead — this rebuilds all
-          // loop/connection state from scratch rather than possibly retrying
-          // against the same wedged connection object forever. The restart
-          // itself will send its own AUTO-RESTART STARTING/COMPLETE notices.
-          // This escalation path can now actually run reliably, since
-          // reconnect()/safeClose() can no longer hang indefinitely.
           if (stuckMs >= RECONNECT_STUCK_RESTART_MS) {
             console.warn(`🚨 Reconnect stuck for ${stuckMin} min — forcing full restart`);
             reconnectFailStreakRef.current = 0;
@@ -1411,7 +1387,6 @@ export default function MainScreen() {
             break;
           }
 
-          // exponential backoff instead of a flat 5s retry forever.
           reconnectFailStreakRef.current += 1;
           const backoffMs = Math.min(
             RECONNECT_BACKOFF_BASE_MS * reconnectFailStreakRef.current,
@@ -1437,17 +1412,20 @@ export default function MainScreen() {
       await notifyNetworkError(String(outerErr));
       Alert.alert('Error', 'Something went wrong with the SMS process.');
     } finally {
-      await safeClose();
+      
+      if (myLoopId === ACTIVE_LOOP_ID) await safeClose();
     }
+
+   
+    return myLoopId !== ACTIVE_LOOP_ID ? 'superseded' : 'ended';
   }, [
     reconnect, sendSMSStable, queueEmailStable, markSent, notifyNetworkError,
     updateServiceStatus, isSmsWindowOpen, isLogTimeWithinWindow, _requestRestart,
-    dbUpdate, dbQuery,
+    dbUpdate, dbQuery, lockSending, releaseLock, recoverStaleLocks, isDuplicateLog,
+    handleMaxFailures,
   ]);
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // LIFECYCLE COORDINATOR — flat loop, zero recursion
-  // ─────────────────────────────────────────────────────────────────────────────
+
   const lifecycleCoordinator = useCallback(async () => {
     if (coordinatorRunningRef.current) {
       console.log('lifecycleCoordinator: already running, ignoring');
@@ -1461,11 +1439,8 @@ export default function MainScreen() {
       restartSignalRef.current         = SIGNAL_NONE;
       restartReasonRef.current         = '';
       coordinatorRestartingRef.current = false;
-      // fresh slate for this cycle — whatever was set during the PREVIOUS
-      // restart has already been consumed, so start this one clean.
       restartStartNotifiedRef.current  = false;
       cycleCountRef.current            = 0; setCycleCount(0);
-      sendingSeedsRef.current          = new Set();
       networkErrorSentRef.current      = false;
 
       setIsRunning(true);
@@ -1478,7 +1453,6 @@ export default function MainScreen() {
       if (!isFirstRun) {
         const reason = restartReasonRef.current || 'Scheduled restart';
         const nowTs  = Date.now();
-        // hard cooldown — see RESTART_NOTIF_COOLDOWN_MS comment above.
         if (nowTs - lastRestartNotifSentAtRef.current >= RESTART_NOTIF_COOLDOWN_MS) {
           lastRestartNotifSentAtRef.current = nowTs;
           const msg =
@@ -1501,8 +1475,15 @@ export default function MainScreen() {
       }
       isFirstRun = false;
 
-      try { await runLoop(); }
+      let loopResult;
+      try { loopResult = await runLoop(); }
       catch (e) { console.error('lifecycleCoordinator: runLoop threw:', e); }
+
+     
+      if (loopResult === 'superseded') {
+        console.log('⏭️ Coordinator: superseded by a newer loop — exiting quietly');
+        return;
+      }
 
       const signal = restartSignalRef.current;
       _stopNativeWatchdog();
@@ -1512,18 +1493,7 @@ export default function MainScreen() {
         break;
       }
 
-      // 🔧 FIXED — SIGNAL_NONE here used to be treated exactly like an
-      // explicit SIGNAL_STOP and would silently break out of this loop.
-      // But a real, deliberate stop is ALWAYS SIGNAL_STOP (set only by
-      // _requestStop(), called from doStop()/_deactivateProcessing()).
-      // SIGNAL_NONE reaching this point means runLoop() returned/threw
-      // WITHOUT ever setting a signal at all — which is never a
-      // legitimate reason to stop (the one known way this could happen —
-      // an unhandled initial-connect failure — is fixed above, but this
-      // is kept as a belt-and-suspenders guard against any other future
-      // code path with the same shape). Treat it as an unexpected failure
-      // and auto-restart instead of silently killing the coordinator and
-      // mislabeling the status as "window closed" while it's still open.
+    
       if (signal === SIGNAL_NONE) {
         console.warn(
           '⚠️ Coordinator: runLoop exited without a restart/stop signal — ' +
@@ -1541,12 +1511,7 @@ export default function MainScreen() {
       setStatusMessage(`🔄 Auto-restarting (${reason})...`);
       updateServiceStatus(`🔄 Restarting: ${reason}`);
 
-      // Only send the generic "STARTING" notice if nothing already told
-      // admins about THIS SPECIFIC restart (e.g. the watchdog-stuck alert,
-      // which sets restartStartNotifiedRef = true before requesting the
-      // restart). This is what stops admins/parents from getting 2-3
-      // messages for what is really one restart event — now it's exactly
-      // one "it's restarting" notice, no matter which trigger caused it.
+      
       const nowTsStart = Date.now();
       if (
         !restartStartNotifiedRef.current &&
@@ -1581,13 +1546,6 @@ export default function MainScreen() {
 
     if (windowSchedulerActiveRef.current) {
       const st = startTimeRef.current;
-      // 🔧 FIXED — this used to unconditionally claim "window closed" any
-      // time the coordinator loop exited while the scheduler was active,
-      // even when the actual cause had nothing to do with the window
-      // (see the SIGNAL_NONE fix above). Now it only shows that specific
-      // message when the window is genuinely closed right now; otherwise
-      // it surfaces an honest "stopped unexpectedly" status so this is
-      // never silently misdiagnosed as normal window behavior again.
       if (!isSmsWindowOpen()) {
         setStatusMessage(`🔴 Stopped (SMS window closed). Auto-starts at ${formatTime(st)}.`);
         updateServiceStatus(`Stopped — auto-starts ${formatTime(st)}`);
@@ -1604,10 +1562,7 @@ export default function MainScreen() {
     updateServiceStatus, isSmsWindowOpen,
   ]);
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // 🔧 FIXED — added activatingRef re-entrancy guard (see field comment
-  // above) so a second applyWindowSchedule() tick landing in the async gap
-  // before coordinatorRunningRef flips true can't call this a second time.
+
   const _activateProcessing = useCallback(async () => {
     if (coordinatorRunningRef.current || activatingRef.current) return;
     activatingRef.current = true;
@@ -1634,7 +1589,7 @@ export default function MainScreen() {
     _requestStop();
   }, [_requestStop, notifySmsWindowClose, updateServiceStatus]);
 
-  // ─────────────────────────────────────────────────────────────────────────────
+ 
   const _scheduleNextPreciseCheck = useCallback(() => {
     if (windowScheduleTimeoutRef.current) {
       clearTimeout(windowScheduleTimeoutRef.current);
@@ -1668,7 +1623,7 @@ export default function MainScreen() {
     applyWindowScheduleRef.current = applyWindowSchedule;
   }, [applyWindowSchedule]);
 
-  // ── doStop / doStart — the ONLY places that touch the foreground service ────
+ 
   const doStop = useCallback((silent = false) => {
     windowSchedulerActiveRef.current = false;
     if (windowScheduleTimeoutRef.current) {
@@ -1676,6 +1631,7 @@ export default function MainScreen() {
       windowScheduleTimeoutRef.current = null;
     }
     _requestStop();
+    ACTIVE_LOOP_ID++;   
     isRunningRef.current          = false;
     coordinatorRunningRef.current = false;
     setIsRunning(false);
@@ -1690,11 +1646,7 @@ export default function MainScreen() {
 
   const doStart = useCallback(async () => {
     if (windowSchedulerActiveRef.current) return;
-    // this flag now flips to true BEFORE the first `await` below.
-    // Previously it was set AFTER `await AsyncStorage.setItem(...)`, which
-    // left a window where calling doStart() twice in quick succession
-    // (e.g. auto-resume-on-launch racing a manual Start tap) could let
-    // both calls pass the guard above before either one claimed it.
+    
     windowSchedulerActiveRef.current = true;
     restartSignalRef.current = SIGNAL_NONE;
     try { await AsyncStorage.setItem(APP_SHOULD_RUN_KEY, 'true'); } catch {}
@@ -1712,7 +1664,7 @@ export default function MainScreen() {
     applyWindowSchedule();
   }, [startForegroundService, updateServiceStatus, isSmsWindowOpen, applyWindowSchedule]);
 
-  // ── handleStart / handleStop ──────────────────────────────────────────────────
+
   const handleStart = useCallback(async () => {
     Keyboard.dismiss();
     if (!numStudents || !idleSeconds || !deviceName) {
@@ -1744,9 +1696,7 @@ export default function MainScreen() {
     navigation?.navigate('Settings');
   };
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // Render
-  // ─────────────────────────────────────────────────────────────────────────────
+
   const intervalLabel = AUTO_RESTART_INTERVAL_MS < 60 * 60 * 1000
     ? `${AUTO_RESTART_INTERVAL_MS / 60000} min`
     : `${AUTO_RESTART_INTERVAL_MS / 3_600_000} hr`;
@@ -1767,8 +1717,7 @@ export default function MainScreen() {
                 <TextInput
                   style={[styles.input, displayDashboard && styles.inputDisabled]}
                   keyboardType="numeric" value={numStudents}
-                  onChangeText={setNumStudents} editable={!displayDashboard}
-                />
+                  onChangeText={setNumStudents} editable={!displayDashboard}/>
               </View>
 
               <View style={styles.inputGroup}>
@@ -1776,8 +1725,7 @@ export default function MainScreen() {
                 <TextInput
                   style={[styles.input, displayDashboard && styles.inputDisabled]}
                   keyboardType="numeric" value={idleSeconds}
-                  onChangeText={setIdleSeconds} editable={!displayDashboard}
-                />
+                  onChangeText={setIdleSeconds} editable={!displayDashboard}/>
               </View>
 
               <View style={styles.inputGroup}>

@@ -3,7 +3,7 @@ import { GoogleSignin } from '@react-native-google-signin/google-signin';
 import { encode as base64Encode } from 'base-64';
 import utf8 from 'utf8';
 
-// ---- 1. Get Signed In Email ----
+// Get Signed In Email 
 export const getSignedInEmail = async () => {
   try {
     const user = await GoogleSignin.getCurrentUser();
@@ -14,7 +14,7 @@ export const getSignedInEmail = async () => {
   }
 };
 
-// ---- 2. Get Access Token Silently ----
+// Get Access Token Silently 
 export const getAccessTokenSilently = async () => {
   try {
     await GoogleSignin.hasPlayServices({
@@ -32,7 +32,7 @@ export const getAccessTokenSilently = async () => {
   }
 };
 
-// ---- 3. Sign-in if needed (interactive) ----
+// Sign-in if needed (interactive) 
 export const signInWithGoogleOnce = async () => {
   try {
     await GoogleSignin.hasPlayServices({
@@ -45,7 +45,7 @@ export const signInWithGoogleOnce = async () => {
   }
 };
 
-// ---- 4. Fetch Access Token (silent → interactive fallback) ----
+// Fetch Access Token 
 export const fetchAccessToken = async () => {
   let token = await getAccessTokenSilently();
   if (!token) {
@@ -55,7 +55,7 @@ export const fetchAccessToken = async () => {
   return token;
 };
 
-// ---- 5. Send Email via Gmail API ----
+// Send Email via Gmail API 
 export const sendEmailViaGmailAPI = async (to, subject, message, accessToken) => {
   if (!accessToken) return false;
 

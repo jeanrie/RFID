@@ -27,7 +27,7 @@ export default function ConfigurationScreen({ navigation }) {
   const [adminEmails, setAdminEmails] = useState(''); // New state for email addresses
 
 
-  // ✅ Load saved configuration on mount
+  
   useEffect(() => {
     (async () => {
       try {
@@ -54,7 +54,7 @@ export default function ConfigurationScreen({ navigation }) {
     })();
   }, []);
 
-  // ✅ Test Connection to SQL Server
+  // Test Connection to SQL Server
   const handleTestConnection = async () => {
     if (!serverName || !databaseName || !username || !password) {
       Alert.alert('Missing Information', 'Please fill out all required fields.');
@@ -86,7 +86,7 @@ export default function ConfigurationScreen({ navigation }) {
     }
   };
 
-  // ✅ Save Configuration
+  
   const handleSave = async () => {
     if (!deviceName || !serverName || !databaseName || !username || !password) {
       Alert.alert('Missing Information', 'Please fill out all fields before saving.');
@@ -138,8 +138,7 @@ export default function ConfigurationScreen({ navigation }) {
                 style={styles.input}
                 placeholder="Enter Device Name"
                 value={deviceName}
-                onChangeText={setDeviceName}
-              />
+                onChangeText={setDeviceName}/>
             </View>
 
             <View style={styles.inputGroup}>
@@ -148,8 +147,7 @@ export default function ConfigurationScreen({ navigation }) {
                 style={styles.input}
                 placeholder="Enter Server Name"
                 value={serverName}
-                onChangeText={setServerName}
-              />
+                onChangeText={setServerName}/>
             </View>
 
             <View style={styles.inputGroup}>
@@ -158,8 +156,7 @@ export default function ConfigurationScreen({ navigation }) {
                 style={styles.input}
                 placeholder="Enter Database Name"
                 value={databaseName}
-                onChangeText={setDatabaseName}
-              />
+                onChangeText={setDatabaseName} />
             </View>
 
             <View style={styles.inputGroup}>
@@ -168,8 +165,7 @@ export default function ConfigurationScreen({ navigation }) {
                 style={styles.input}
                 placeholder="Enter Username"
                 value={username}
-                onChangeText={setUsername}
-              />
+                onChangeText={setUsername}/>
             </View>
 
             <View style={styles.inputGroup}>
@@ -179,8 +175,7 @@ export default function ConfigurationScreen({ navigation }) {
                 placeholder="Enter Password"
                 secureTextEntry={true}
                 value={password}
-                onChangeText={setPassword}
-              />
+                onChangeText={setPassword}/>
             </View>
 
             <View style={styles.buttonContainer}>
@@ -203,8 +198,7 @@ export default function ConfigurationScreen({ navigation }) {
                 numberOfLines={4}
                 textAlignVertical="top"
                 value={arrivalMessage}
-                onChangeText={setArrivalMessage}
-              />
+                onChangeText={setArrivalMessage}/>
             </View>
 
             <View style={styles.inputGroup}>
@@ -216,12 +210,11 @@ export default function ConfigurationScreen({ navigation }) {
                 numberOfLines={4}
                 textAlignVertical="top"
                 value={departureMessage}
-                onChangeText={setDepartureMessage}
-              />
+                onChangeText={setDepartureMessage} />
             </View>
           </View>
 
-          {/* --- Container 3 --- */}
+         
           <View style={styles.formContainer}>
             <View style={styles.inputGroup}>
               <Text style={styles.label}>Admin Alert Numbers</Text>
@@ -241,8 +234,7 @@ export default function ConfigurationScreen({ navigation }) {
               value={adminEmails}
               onChangeText={setAdminEmails}
               keyboardType="email-address"
-              autoCapitalize="none"
-            />
+              autoCapitalize="none"/>
           </View>
 
 
@@ -255,7 +247,7 @@ export default function ConfigurationScreen({ navigation }) {
             </View>
           </View>
 
-          {/* --- Switch --- */}
+          
           <View style={styles.formContainer}>
             <View style={[styles.inputGroup, { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }]}>
               <Text style={styles.label}>Display Dashboard Setting</Text>
@@ -268,7 +260,7 @@ export default function ConfigurationScreen({ navigation }) {
             </View>
           </View>
 
-          {/* --- Buttons --- */}
+        
           <View style={styles.buttonContainer}>
             <TouchableOpacity
               style={[styles.button, { backgroundColor: '#1A2A4F' }]}

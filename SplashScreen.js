@@ -4,12 +4,12 @@ import { View, Image, StyleSheet } from 'react-native';
 
 const SplashScreen = ({ navigation }) => {
   useEffect(() => {
-    // Navigate to the main screen after 3 seconds
+  
     const timer = setTimeout(() => {
       navigation.replace('Main'); 
     }, 3000); 
 
-    return () => clearTimeout(timer); // Clear timeout on unmount
+    return () => clearTimeout(timer);
   }, [navigation]);
 
   return (
